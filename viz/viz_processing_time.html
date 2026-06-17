@@ -16,6 +16,9 @@
         .subtitle { font-size: 13px; color: #6c757d; margin-bottom: 24px; }
         .chart-wrap { position: relative; height: 450px; margin-bottom: 16px; }
         .footnote { font-size: 11px; color: #6c757d; line-height: 1.6; margin-top: 12px; }
+        .status{font-size:11px;color:#6c757d;margin-bottom:8px;min-height:14px}
+        .status .live{color:#28a745;font-weight:600}
+        .status .stale{color:#b45309;font-weight:600}
         .btn-download {
             display: inline-block; margin-top: 16px; padding: 8px 16px;
             background: #003366; color: white; border: none; border-radius: 4px;
@@ -34,6 +37,7 @@
     </div>
     <h1>Median Days from Request to Decision by Administration</h1>
     <p class="subtitle">How long each administration takes to approve or deny Major Disaster declaration requests</p>
+    <div class="status" id="status">Loading live data from OpenFEMA…</div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <div class="footnote">
         Processing time = days between state's declaration request date and the federal decision date.
@@ -46,13 +50,67 @@ const labels = ['Bush 1\n(2001–05)', 'Bush 2\n(2005–09)', 'Obama 1\n(2009–
 
 Chart.defaults.font.family = "'Aptos', 'Segoe UI', Roboto, sans-serif";
 
-const medianApproval = [6.0, 11, 12, 10.0, 18.0, 19.0, 38.5];
-const medianDenial = [33.5, 64.0, 44, 29, 61, 52.0, 108];
-const avgApproval = [7.9, 15.2, 13.9, 11.8, 23.8, 22.8, 40.5];
-const avgDenial = [47.0, 67.6, 54.3, 38.4, 68.2, 83.4, 113.3];
+// Fallback (offline) values — last computed
+const FB_medianApproval = [6.0, 11, 12, 10.0, 18.0, 19.0, 38.5];
+const FB_medianDenial = [33.5, 64.0, 44, 29, 61, 52.0, 108];
+const FB_avgApproval = [7.9, 15.2, 13.9, 11.8, 23.8, 22.8, 40.5];
+const FB_avgDenial = [47.0, 67.6, 54.3, 38.4, 68.2, 83.4, 113.3];
 
+// Module-scope data arrays, populated live (or from fallback)
+let medianApproval, medianDenial, avgApproval, avgDenial;
+let chart;
+
+const API='https://www.fema.gov/api/open/v1/';
+async function fetchAll(ep,filter,select){
+  let out=[],skip=0;
+  while(true){
+    const q=`$filter=${encodeURIComponent(filter)}&$select=${encodeURIComponent(select)}&$top=1000&$skip=${skip}&$format=json`;
+    const r=await fetch(API+ep+'?'+q); if(!r.ok) throw new Error(ep+' '+r.status);
+    const d=await r.json(); const k=Object.keys(d).find(x=>x!=='metadata'); const rows=d[k]||[];
+    out=out.concat(rows); if(rows.length<1000) break; skip+=1000;
+  }
+  return out;
+}
+const ADMINS=[['Bush 1','2001-01-20','2005-01-20'],['Bush 2','2005-01-20','2009-01-20'],['Obama 1','2009-01-20','2013-01-20'],['Obama 2','2013-01-20','2017-01-20'],['Trump 1','2017-01-20','2021-01-20'],['Biden','2021-01-20','2025-01-20'],['Trump 2','2025-01-20','2100-01-01']];
+function adminIdx(d){ if(!d) return -1; for(let i=0;i<ADMINS.length;i++){ if(d>=ADMINS[i][1]&&d<ADMINS[i][2]) return i; } return -1; }
+const d10=d=>(d||'').slice(0,10);
+function median(a){ if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2? s[m] : (s[m-1]+s[m])/2; }
+function r1(x){ return Math.round(x*10)/10; }
+function daysBetween(a,b){ return Math.round((new Date(b)-new Date(a))/86400000); }
+async function getData(){
+  const [approvedRaw,deniedRaw]=await Promise.all([
+    fetchAll('FemaWebDisasterDeclarations',"declarationType eq 'Major Disaster' and declarationDate ge '2001-01-01'",'disasterNumber,declarationDate,declarationRequestDate,incidentType'),
+    fetchAll('DeclarationDenials',"declarationRequestType eq 'Major Disaster' and declarationRequestDate ge '2000-06-01'",'declarationRequestDate,requestStatusDate,currentRequestStatus,requestedIncidentTypes')
+  ]);
+  const seen=new Set(); const approved=[];
+  for(const r of approvedRaw){ if(seen.has(r.disasterNumber))continue; seen.add(r.disasterNumber); if((r.incidentType||'')==='Biological')continue; approved.push(r); }
+  const denied=deniedRaw.filter(r=>r.currentRequestStatus==='Turndown' && !((r.requestedIncidentTypes||'').includes('Biological')));
+  return {approved,denied};
+}
+
+function compute(data){
+  const apprDays=ADMINS.map(()=>[]);
+  const denDays=ADMINS.map(()=>[]);
+  for(const r of data.approved){
+    const idx=adminIdx(d10(r.declarationDate));
+    if(idx===-1) continue;
+    apprDays[idx].push(daysBetween(r.declarationRequestDate, r.declarationDate));
+  }
+  for(const r of data.denied){
+    const idx=adminIdx(d10(r.requestStatusDate));
+    if(idx===-1) continue;
+    denDays[idx].push(daysBetween(r.declarationRequestDate, r.requestStatusDate));
+  }
+  const mean=a=>a.length? a.reduce((s,x)=>s+x,0)/a.length : 0;
+  medianApproval=apprDays.map(a=>r1(median(a)));
+  avgApproval=apprDays.map(a=>r1(mean(a)));
+  medianDenial=denDays.map(a=>r1(median(a)));
+  avgDenial=denDays.map(a=>r1(mean(a)));
+}
+
+function buildChart() {
 const ctx = document.getElementById('chart').getContext('2d');
-const chart = new Chart(ctx, {
+chart = new Chart(ctx, {
     type: 'bar',
     data: {
         labels: labels,
@@ -132,6 +190,7 @@ const chart = new Chart(ctx, {
         }
     }]
 });
+}
 
 function downloadPNG() {
     const link = document.createElement('a');
@@ -139,6 +198,25 @@ function downloadPNG() {
     link.href = chart.toBase64Image('image/png', 1);
     link.click();
 }
+
+(async function load(){
+    const statusEl = document.getElementById('status');
+    try {
+        const data = await getData();
+        compute(data);
+        buildChart();
+        const dateStr = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+        statusEl.innerHTML = `<span class="live">● Live</span> — fetched from OpenFEMA on ${dateStr}.`;
+    } catch (e) {
+        console.error(e);
+        medianApproval = FB_medianApproval;
+        medianDenial = FB_medianDenial;
+        avgApproval = FB_avgApproval;
+        avgDenial = FB_avgDenial;
+        buildChart();
+        statusEl.innerHTML = `<span class="stale">● Offline</span> — couldn't reach OpenFEMA; showing last computed values.`;
+    }
+})();
 </script>
 </body>
 </html>

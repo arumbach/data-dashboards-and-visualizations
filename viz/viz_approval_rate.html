@@ -19,12 +19,17 @@
         .subtitle { font-size: 13px; color: #6c757d; margin-bottom: 24px; }
         .chart-wrap { position: relative; height: 420px; margin-bottom: 16px; }
         .footnote { font-size: 11px; color: #6c757d; line-height: 1.6; margin-top: 12px; }
+        .status { font-size: 11px; color: #6c757d; margin-bottom: 8px; min-height: 14px; }
+        .status .live { color: #28a745; font-weight: 600; }
+        .status .stale { color: #b45309; font-weight: 600; }
+        .loading { display:flex; align-items:center; justify-content:center; height:100%; color:#6c757d; font-size:14px; }
         .btn-download {
             display: inline-block; margin-top: 16px; padding: 8px 16px;
             background: #003366; color: white; border: none; border-radius: 4px;
             font-size: 13px; cursor: pointer; text-decoration: none;
         }
         .btn-download:hover { background: #004488; }
+        .btn-download[disabled]{ opacity:.5; cursor:not-allowed; }
     </style>
     <!-- GoatCounter analytics -->
     <script data-goatcounter="https://disasterlab.goatcounter.com/count"
@@ -37,91 +42,181 @@
     </div>
     <h1>Major Disaster Declaration Denial Rate by Administration</h1>
     <p class="subtitle">Percentage of Major Disaster declaration requests denied, by presidential administration (2001–present)</p>
-    <div class="chart-wrap"><canvas id="chart"></canvas></div>
-    <div class="footnote">
-        Denial rate = denied declarations ÷ total requests × 100. Major Disaster declarations only.
-        Trump 2 is a partial term (Jan 2025–present). COVID-19 declarations excluded. Data: OpenFEMA API.
+    <div class="status" id="status">Loading live data from OpenFEMA…</div>
+    <div class="chart-wrap"><div class="loading" id="loading">Fetching declarations &amp; denials…</div><canvas id="chart" style="display:none;"></canvas></div>
+    <div class="footnote" id="footnote">
+        Denial rate = denied declarations ÷ total requests × 100. Major Disaster declarations only, bucketed by decision date.
+        Trump 2 is a partial term (Jan 2025–present). COVID-19 (Biological) declarations excluded. Data: OpenFEMA API.
     </div>
-    <button class="btn-download" onclick="downloadPNG()">Download as PNG</button>
+    <button class="btn-download" id="dl" onclick="downloadPNG()" disabled>Download as PNG</button>
 
 <script>
 Chart.defaults.font.family = "'Aptos', 'Segoe UI', Roboto, sans-serif";
 
-const labels = ['Bush 1\n(2001–05)', 'Bush 2\n(2005–09)', 'Obama 1\n(2009–13)', 'Obama 2\n(2013–17)', 'Trump 1\n(2017–21)', 'Biden\n(2021–25)', 'Trump 2\n(2025–)'];
-const denialRates = [17.7, 15.9, 13.2, 18.8, 13.2, 15.0, 27.5];
-const approvalRates = [82.3, 84.1, 86.8, 81.2, 86.8, 85.0, 72.5];
-const colors = ['#b91c1c', '#f87171', '#1d4ed8', '#3b82f6', '#dc2626', '#2563eb', '#ef4444'];
-const denialColors = ['rgba(185,28,28,0.85)', 'rgba(248,113,113,0.85)', 'rgba(29,78,216,0.85)', 'rgba(59,130,246,0.85)', 'rgba(220,38,38,0.85)', 'rgba(37,99,235,0.85)', 'rgba(239,68,68,0.85)'];
+/* ---- administrations (inauguration boundaries) ---- */
+const ADMINS = [
+    { name:'Bush 1',  period:'(2001–05)', start:'2001-01-20', end:'2005-01-20', color:'#b91c1c', fill:'rgba(185,28,28,0.85)' },
+    { name:'Bush 2',  period:'(2005–09)', start:'2005-01-20', end:'2009-01-20', color:'#f87171', fill:'rgba(248,113,113,0.85)' },
+    { name:'Obama 1', period:'(2009–13)', start:'2009-01-20', end:'2013-01-20', color:'#1d4ed8', fill:'rgba(29,78,216,0.85)' },
+    { name:'Obama 2', period:'(2013–17)', start:'2013-01-20', end:'2017-01-20', color:'#3b82f6', fill:'rgba(59,130,246,0.85)' },
+    { name:'Trump 1', period:'(2017–21)', start:'2017-01-20', end:'2021-01-20', color:'#dc2626', fill:'rgba(220,38,38,0.85)' },
+    { name:'Biden',   period:'(2021–25)', start:'2021-01-20', end:'2025-01-20', color:'#2563eb', fill:'rgba(37,99,235,0.85)' },
+    { name:'Trump 2', period:'(2025–)',   start:'2025-01-20', end:'2100-01-01', color:'#ef4444', fill:'rgba(239,68,68,0.85)' }
+];
 
-const ctx = document.getElementById('chart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: labels,
-        datasets: [{
-            label: 'Denial Rate (%)',
-            data: denialRates,
-            backgroundColor: denialColors,
-            borderColor: colors,
-            borderWidth: 2,
-            borderRadius: 4,
-            barPercentage: 0.65
-        }]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-            legend: { display: false },
-            tooltip: {
-                callbacks: {
-                    label: ctx => {
-                        const i = ctx.dataIndex;
-                        return [
-                            `Denial Rate: ${denialRates[i]}%`,
-                            `Approval Rate: ${approvalRates[i]}%`
-                        ];
-                    }
-                }
+/* ---- fallback: last values computed from OpenFEMA (used only if the live fetch fails) ---- */
+const FALLBACK = { denial:[17.7,15.9,13.2,18.8,13.2,14.8,29.6], counts:[260,289,326,239,266,324,81] };
+
+const API = 'https://www.fema.gov/api/open/v1/';
+async function fetchAll(endpoint, filter, select){
+    let out=[], skip=0;
+    while(true){
+        const q = `$filter=${encodeURIComponent(filter)}&$select=${encodeURIComponent(select)}&$top=1000&$skip=${skip}&$format=json`;
+        const resp = await fetch(API+endpoint+'?'+q);
+        if(!resp.ok) throw new Error(endpoint+' '+resp.status);
+        const data = await resp.json();
+        const key = Object.keys(data).find(k=>k!=='metadata');
+        const rows = data[key]||[];
+        out = out.concat(rows);
+        if(rows.length<1000) break;
+        skip += 1000;
+    }
+    return out;
+}
+const d10 = d => (d||'').slice(0,10);
+function adminIndex(date){
+    if(!date) return -1;
+    for(let i=0;i<ADMINS.length;i++){ if(date>=ADMINS[i].start && date<ADMINS[i].end) return i; }
+    return -1;
+}
+
+let chart=null;
+
+async function load(){
+    const statusEl=document.getElementById('status');
+    try{
+        const [approved, denied] = await Promise.all([
+            fetchAll('FemaWebDisasterDeclarations',
+                "declarationType eq 'Major Disaster' and declarationDate ge '2001-01-01'",
+                'disasterNumber,declarationDate,incidentType'),
+            fetchAll('DeclarationDenials',
+                "declarationRequestType eq 'Major Disaster' and declarationRequestDate ge '2000-06-01'",
+                'requestStatusDate,currentRequestStatus,requestedIncidentTypes')
+        ]);
+
+        // approved: one row per disasterNumber, exclude COVID/Biological
+        const appr = new Array(ADMINS.length).fill(0);
+        const seen = new Set();
+        let lastDate = '';
+        for(const r of approved){
+            if(seen.has(r.disasterNumber)) continue;
+            seen.add(r.disasterNumber);
+            if((r.incidentType||'')==='Biological') continue;
+            const dd = d10(r.declarationDate);
+            if(dd>lastDate) lastDate=dd;
+            const i = adminIndex(dd);
+            if(i>=0) appr[i]++;
+        }
+        // denied: turndowns only, exclude COVID/Biological, bucket by decision (status) date
+        const deny = new Array(ADMINS.length).fill(0);
+        for(const r of denied){
+            if(r.currentRequestStatus!=='Turndown') continue;
+            if((r.requestedIncidentTypes||'').includes('Biological')) continue;
+            const i = adminIndex(d10(r.requestStatusDate));
+            if(i>=0) deny[i]++;
+        }
+
+        const denial=[], counts=[];
+        for(let i=0;i<ADMINS.length;i++){
+            const t = appr[i]+deny[i];
+            denial.push(t ? Math.round(1000*deny[i]/t)/10 : 0);
+            counts.push(t);
+        }
+        const apprCounts = appr, denyCounts = deny;
+        render(denial, counts, {appr:apprCounts, deny:denyCounts});
+        const asOf = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+        statusEl.innerHTML = `<span class="live">● Live</span> — fetched from OpenFEMA on ${asOf}. Latest decision in data: ${fmt(lastDate)}.`;
+        document.getElementById('footnote').innerHTML =
+            `Denial rate = denied declarations ÷ total requests × 100. Major Disaster declarations only, bucketed by decision date. `+
+            `Trump 2 is a partial term (Jan 2025–present). COVID-19 (Biological) declarations excluded. `+
+            `Data fetched live from the <a href="https://www.fema.gov/about/openfema/api" style="color:#003366;">OpenFEMA API</a>; latest decision in data: ${fmt(lastDate)}.`;
+    }catch(err){
+        console.error(err);
+        render(FALLBACK.denial, FALLBACK.counts, null);
+        statusEl.innerHTML = `<span class="stale">● Offline</span> — couldn't reach OpenFEMA; showing last computed values.`;
+    }
+    document.getElementById('dl').disabled=false;
+}
+
+function fmt(d){
+    if(!d) return '—';
+    const [y,m,day]=d.split('-');
+    return new Date(y,m-1,day).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'});
+}
+
+function render(denialRates, counts, raw){
+    document.getElementById('loading').style.display='none';
+    const canvas=document.getElementById('chart');
+    canvas.style.display='block';
+    const ctx=canvas.getContext('2d');
+    if(chart) chart.destroy();
+    chart = new Chart(ctx,{
+        type:'bar',
+        data:{
+            labels: ADMINS.map(a=>[a.name, a.period]),
+            datasets:[{
+                label:'Denial Rate (%)',
+                data: denialRates,
+                backgroundColor: ADMINS.map(a=>a.fill),
+                borderColor: ADMINS.map(a=>a.color),
+                borderWidth:2, borderRadius:4, barPercentage:0.65
+            }]
+        },
+        options:{
+            responsive:true, maintainAspectRatio:false,
+            plugins:{
+                legend:{display:false},
+                tooltip:{ callbacks:{ label:(c)=>{
+                    const i=c.dataIndex;
+                    const lines=[`Denial rate: ${denialRates[i]}%`, `Approval rate: ${Math.round((100-denialRates[i])*10)/10}%`];
+                    if(raw) lines.push(`${raw.deny[i]} denied of ${counts[i]} requests`);
+                    else lines.push(`${counts[i]} requests`);
+                    return lines;
+                }}}
+            },
+            scales:{
+                y:{ beginAtZero:true, max:40,
+                    title:{display:true,text:'Denial Rate (%)',font:{size:13,weight:'600'}},
+                    ticks:{callback:v=>v+'%'}, grid:{color:'#f0f0f0'} },
+                x:{ grid:{display:false}, ticks:{font:{size:12}} }
             }
         },
-        scales: {
-            y: {
-                beginAtZero: true,
-                max: 40,
-                title: { display: true, text: 'Denial Rate (%)', font: { size: 13, weight: '600' } },
-                ticks: { callback: v => v + '%' },
-                grid: { color: '#f0f0f0' }
-            },
-            x: {
-                grid: { display: false },
-                ticks: { font: { size: 12 } }
+        plugins:[{
+            afterDraw:(ch)=>{
+                const c=ch.ctx;
+                ch.data.datasets[0].data.forEach((val,i)=>{
+                    const bar=ch.getDatasetMeta(0).data[i];
+                    c.save();
+                    c.fillStyle='#1a1a2e';
+                    c.font='bold 14px Aptos, Segoe UI, sans-serif';
+                    c.textAlign='center';
+                    c.fillText(val+'%', bar.x, bar.y-8);
+                    c.restore();
+                });
             }
-        }
-    },
-    plugins: [{
-        afterDraw: function(chart) {
-            const ctx = chart.ctx;
-            chart.data.datasets[0].data.forEach((val, i) => {
-                const meta = chart.getDatasetMeta(0);
-                const bar = meta.data[i];
-                ctx.save();
-                ctx.fillStyle = '#1a1a2e';
-                ctx.font = 'bold 14px Aptos, Segoe UI, sans-serif';
-                ctx.textAlign = 'center';
-                ctx.fillText(val + '%', bar.x, bar.y - 8);
-                ctx.restore();
-            });
-        }
-    }]
-});
+        }]
+    });
+}
 
-function downloadPNG() {
-    const link = document.createElement('a');
-    link.download = 'fema_denial_rate_by_admin.png';
-    link.href = chart.toBase64Image('image/png', 1);
+function downloadPNG(){
+    if(!chart) return;
+    const link=document.createElement('a');
+    link.download='fema_denial_rate_by_admin.png';
+    link.href=chart.toBase64Image('image/png',1);
     link.click();
 }
+
+load();
 </script>
 </body>
 </html>

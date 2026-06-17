@@ -16,6 +16,9 @@
         .subtitle { font-size: 13px; color: #6c757d; margin-bottom: 24px; }
         .chart-wrap { position: relative; height: 500px; margin-bottom: 16px; }
         .footnote { font-size: 11px; color: #6c757d; line-height: 1.6; margin-top: 12px; }
+        .status{font-size:11px;color:#6c757d;margin-bottom:8px;min-height:14px}
+        .status .live{color:#28a745;font-weight:600}
+        .status .stale{color:#b45309;font-weight:600}
         .btn-download {
             display: inline-block; margin-top: 16px; padding: 8px 16px;
             background: #003366; color: white; border: none; border-radius: 4px;
@@ -34,6 +37,7 @@
     </div>
     <h1>Major Disaster Declarations by Incident Type</h1>
     <p class="subtitle">Top disaster types across seven administration periods — total requests (approved + denied)</p>
+    <div class="status" id="status"></div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <div class="footnote">
         Shows the 8 most common incident types. "Other" aggregates all remaining types.
@@ -48,8 +52,8 @@ Chart.defaults.font.family = "'Aptos', 'Segoe UI', Roboto, sans-serif";
 const admins = ['Bush 1', 'Bush 2', 'Obama 1', 'Obama 2', 'Trump 1', 'Biden', 'Trump 2'];
 const adminColors = ['#b91c1c', '#f87171', '#1d4ed8', '#3b82f6', '#dc2626', '#2563eb', '#ef4444'];
 
-// Build from CSV data — top types by total across all admins
-const typeData = {
+// Build from CSV data — top types by total across all admins (FALLBACK)
+const FB_typeData = {
     'Severe Storm':    [144, 212, 202, 110, 102, 122, 32],
     'Flood':           [18, 14, 34, 63, 66, 72, 13],
     'Hurricane':       [30, 23, 37, 7, 42, 29, 0],
@@ -60,53 +64,108 @@ const typeData = {
     'Tropical Storm':  [0, 0, 0, 0, 0, 15, 1]
 };
 
-const types = Object.keys(typeData);
-const datasets = admins.map((admin, i) => ({
-    label: admin,
-    data: types.map(t => typeData[t][i]),
-    backgroundColor: adminColors[i] + 'cc',
-    borderColor: adminColors[i],
-    borderWidth: 1,
-    borderRadius: 3,
-    barPercentage: 0.85,
-    categoryPercentage: 0.8
-}));
+let chart;
 
-const ctx = document.getElementById('chart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: types,
-        datasets: datasets
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        indexAxis: 'y',
-        plugins: {
-            legend: {
-                position: 'top',
-                labels: { font: { size: 11 }, usePointStyle: true, pointStyle: 'rectRounded', padding: 16 }
+const API='https://www.fema.gov/api/open/v1/';
+async function fetchAll(ep,filter,select){
+  let out=[],skip=0;
+  while(true){
+    const q=`$filter=${encodeURIComponent(filter)}&$select=${encodeURIComponent(select)}&$top=1000&$skip=${skip}&$format=json`;
+    const r=await fetch(API+ep+'?'+q); if(!r.ok) throw new Error(ep+' '+r.status);
+    const d=await r.json(); const k=Object.keys(d).find(x=>x!=='metadata'); const rows=d[k]||[];
+    out=out.concat(rows); if(rows.length<1000) break; skip+=1000;
+  }
+  return out;
+}
+const ADMINS=[['Bush 1','2001-01-20','2005-01-20'],['Bush 2','2005-01-20','2009-01-20'],['Obama 1','2009-01-20','2013-01-20'],['Obama 2','2013-01-20','2017-01-20'],['Trump 1','2017-01-20','2021-01-20'],['Biden','2021-01-20','2025-01-20'],['Trump 2','2025-01-20','2100-01-01']];
+function adminIdx(d){ if(!d) return -1; for(let i=0;i<ADMINS.length;i++){ if(d>=ADMINS[i][1]&&d<ADMINS[i][2]) return i; } return -1; }
+const d10=d=>(d||'').slice(0,10);
+const TYPE_ORDER=['Severe Storm','Flood','Hurricane','Snowstorm/Winter','Fire','Tornado','Severe Ice Storm','Tropical Storm'];
+function bucket(t){
+  if(t==='Snowstorm'||t==='Winter Storm') return 'Snowstorm/Winter';
+  if(['Severe Storm','Flood','Hurricane','Fire','Tornado','Severe Ice Storm','Tropical Storm'].includes(t)) return t;
+  return null;
+}
+async function getData(){
+  const [approvedRaw,deniedRaw]=await Promise.all([
+    fetchAll('FemaWebDisasterDeclarations',"declarationType eq 'Major Disaster' and declarationDate ge '2001-01-01'",'disasterNumber,declarationDate,incidentType'),
+    fetchAll('DeclarationDenials',"declarationRequestType eq 'Major Disaster' and declarationRequestDate ge '2000-06-01'",'requestStatusDate,currentRequestStatus,requestedIncidentTypes')
+  ]);
+  const seen=new Set(); const approved=[];
+  for(const r of approvedRaw){ if(seen.has(r.disasterNumber))continue; seen.add(r.disasterNumber); if((r.incidentType||'')==='Biological')continue; approved.push(r); }
+  const denied=deniedRaw.filter(r=>r.currentRequestStatus==='Turndown' && !((r.requestedIncidentTypes||'').includes('Biological')));
+  return {approved,denied};
+}
+function buildTypeData(approved,denied){
+  const td={}; TYPE_ORDER.forEach(t=>td[t]=[0,0,0,0,0,0,0]);
+  for(const r of approved){ const b=bucket(r.incidentType); const i=adminIdx(d10(r.declarationDate)); if(b&&i>=0) td[b][i]++; }
+  for(const r of denied){ const b=bucket(r.requestedIncidentTypes); const i=adminIdx(d10(r.requestStatusDate)); if(b&&i>=0) td[b][i]++; }
+  return td;
+}
+
+function buildChart(typeData) {
+    const types = Object.keys(typeData);
+    const datasets = admins.map((admin, i) => ({
+        label: admin,
+        data: types.map(t => typeData[t][i]),
+        backgroundColor: adminColors[i] + 'cc',
+        borderColor: adminColors[i],
+        borderWidth: 1,
+        borderRadius: 3,
+        barPercentage: 0.85,
+        categoryPercentage: 0.8
+    }));
+
+    const ctx = document.getElementById('chart').getContext('2d');
+    chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: types,
+            datasets: datasets
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            indexAxis: 'y',
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { font: { size: 11 }, usePointStyle: true, pointStyle: 'rectRounded', padding: 16 }
+                },
+                tooltip: {
+                    callbacks: {
+                        label: ctx => `${ctx.dataset.label}: ${ctx.parsed.x} declarations`
+                    }
+                }
             },
-            tooltip: {
-                callbacks: {
-                    label: ctx => `${ctx.dataset.label}: ${ctx.parsed.x} declarations`
+            scales: {
+                x: {
+                    beginAtZero: true,
+                    title: { display: true, text: 'Total Declarations (Approved + Denied)', font: { size: 12, weight: '600' } },
+                    grid: { color: '#f0f0f0' }
+                },
+                y: {
+                    grid: { display: false },
+                    ticks: { font: { size: 12, weight: '500' } }
                 }
             }
-        },
-        scales: {
-            x: {
-                beginAtZero: true,
-                title: { display: true, text: 'Total Declarations (Approved + Denied)', font: { size: 12, weight: '600' } },
-                grid: { color: '#f0f0f0' }
-            },
-            y: {
-                grid: { display: false },
-                ticks: { font: { size: 12, weight: '500' } }
-            }
         }
+    });
+}
+
+async function load(){
+    try{
+        const {approved,denied}=await getData();
+        buildChart(buildTypeData(approved,denied));
+        const today=new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+        document.getElementById('status').innerHTML=`<span class="live">● Live</span> — fetched from OpenFEMA on ${today}`;
+    }catch(e){
+        console.error(e);
+        buildChart(FB_typeData);
+        document.getElementById('status').innerHTML=`<span class="stale">● Offline</span> — couldn't reach OpenFEMA; showing last computed values.`;
     }
-});
+}
+load();
 
 function downloadPNG() {
     const link = document.createElement('a');

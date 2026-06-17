@@ -26,6 +26,9 @@
             margin-bottom: 28px;
             line-height: 1.5;
         }
+        .status{font-size:12px;color:#6c757d;margin-bottom:16px;min-height:16px}
+        .status .live{color:#28a745;font-weight:600}
+        .status .stale{color:#b45309;font-weight:600}
         table {
             width: 100%;
             border-collapse: collapse;
@@ -126,6 +129,7 @@
         Comparing approval rates, denial rates, and processing times across seven presidential administration periods (2001–present).
         Data from OpenFEMA API. Major Disaster declarations only (COVID-19 excluded).
     </p>
+    <div class="status" id="status">Loading live data from OpenFEMA…</div>
 
     <table>
         <thead>
@@ -151,7 +155,7 @@
     </div>
 
 <script>
-const data = [
+const FB_DATA = [
     { name: "Bush 1",  party: "rep", years: "2001–2005", approved: 214, denied: 46, denialRate: 17.7, medianApproval: 6.0, medianDenial: 33.5 },
     { name: "Bush 2",  party: "rep", years: "2005–2009", approved: 243, denied: 46, denialRate: 15.9, medianApproval: 11, medianDenial: 64.0 },
     { name: "Obama 1",  party: "dem", years: "2009–2013", approved: 283, denied: 43, denialRate: 13.2, medianApproval: 12, medianDenial: 44 },
@@ -161,49 +165,125 @@ const data = [
     { name: "Trump 2",  party: "rep", years: "2025–present", approved: 50, denied: 19, denialRate: 27.5, medianApproval: 38.5, medianDenial: 108, highlight: true }
 ];
 
-const maxMedianApproval = Math.max(...data.map(d => d.medianApproval));
-const maxMedianDenial = Math.max(...data.map(d => d.medianDenial));
-const maxDenialRate = Math.max(...data.map(d => d.denialRate));
+const API='https://www.fema.gov/api/open/v1/';
+async function fetchAll(ep,filter,select){
+  let out=[],skip=0;
+  while(true){
+    const q=`$filter=${encodeURIComponent(filter)}&$select=${encodeURIComponent(select)}&$top=1000&$skip=${skip}&$format=json`;
+    const r=await fetch(API+ep+'?'+q); if(!r.ok) throw new Error(ep+' '+r.status);
+    const d=await r.json(); const k=Object.keys(d).find(x=>x!=='metadata'); const rows=d[k]||[];
+    out=out.concat(rows); if(rows.length<1000) break; skip+=1000;
+  }
+  return out;
+}
+const ADMINS=[['Bush 1','2001-01-20','2005-01-20'],['Bush 2','2005-01-20','2009-01-20'],['Obama 1','2009-01-20','2013-01-20'],['Obama 2','2013-01-20','2017-01-20'],['Trump 1','2017-01-20','2021-01-20'],['Biden','2021-01-20','2025-01-20'],['Trump 2','2025-01-20','2100-01-01']];
+const ADMIN_META=[['Bush 1','rep','2001–2005'],['Bush 2','rep','2005–2009'],['Obama 1','dem','2009–2013'],['Obama 2','dem','2013–2017'],['Trump 1','rep','2017–2021'],['Biden','dem','2021–2025'],['Trump 2','rep','2025–present']];
+function adminIdx(d){ if(!d) return -1; for(let i=0;i<ADMINS.length;i++){ if(d>=ADMINS[i][1]&&d<ADMINS[i][2]) return i; } return -1; }
+const d10=d=>(d||'').slice(0,10);
+function median(a){ if(!a.length) return 0; const s=[...a].sort((x,y)=>x-y); const m=s.length>>1; return s.length%2? s[m] : (s[m-1]+s[m])/2; }
+function r1(x){ return Math.round(x*10)/10; }
+function daysBetween(a,b){ return Math.round((new Date(b)-new Date(a))/86400000); }
+async function getData(){
+  const [approvedRaw,deniedRaw]=await Promise.all([
+    fetchAll('FemaWebDisasterDeclarations',"declarationType eq 'Major Disaster' and declarationDate ge '2001-01-01'",'disasterNumber,declarationDate,declarationRequestDate,incidentType'),
+    fetchAll('DeclarationDenials',"declarationRequestType eq 'Major Disaster' and declarationRequestDate ge '2000-06-01'",'declarationRequestDate,requestStatusDate,currentRequestStatus,requestedIncidentTypes')
+  ]);
+  const seen=new Set(); const approved=[];
+  for(const r of approvedRaw){ if(seen.has(r.disasterNumber))continue; seen.add(r.disasterNumber); if((r.incidentType||'')==='Biological')continue; approved.push(r); }
+  const denied=deniedRaw.filter(r=>r.currentRequestStatus==='Turndown' && !((r.requestedIncidentTypes||'').includes('Biological')));
+  return {approved,denied};
+}
 
-const tbody = document.getElementById('tableBody');
-data.forEach(d => {
-    const total = d.approved + d.denied;
-    const approvalBarW = Math.round((d.medianApproval / maxMedianApproval) * 60);
-    const denialBarW = Math.round((d.medianDenial / maxMedianDenial) * 60);
-    const rateBarW = Math.round((d.denialRate / maxDenialRate) * 50);
+function computeData({approved,denied}){
+  const approvedBuckets=ADMINS.map(()=>[]);
+  const deniedBuckets=ADMINS.map(()=>[]);
+  for(const r of approved){
+    const i=adminIdx(d10(r.declarationDate));
+    if(i>=0) approvedBuckets[i].push(r);
+  }
+  for(const r of denied){
+    const i=adminIdx(d10(r.requestStatusDate));
+    if(i>=0) deniedBuckets[i].push(r);
+  }
+  return ADMIN_META.map((meta,i)=>{
+    const a=approvedBuckets[i].length;
+    const dn=deniedBuckets[i].length;
+    const tot=a+dn;
+    return {
+      name: meta[0],
+      party: meta[1],
+      years: meta[2],
+      approved: a,
+      denied: dn,
+      denialRate: tot? r1(100*dn/tot) : 0,
+      medianApproval: r1(median(approvedBuckets[i].map(r=>daysBetween(r.declarationRequestDate,r.declarationDate)))),
+      medianDenial: r1(median(deniedBuckets[i].map(r=>daysBetween(r.declarationRequestDate,r.requestStatusDate)))),
+      highlight: i===6
+    };
+  });
+}
 
-    const tr = document.createElement('tr');
-    if (d.highlight) tr.classList.add('highlight-row');
-    tr.innerHTML = `
-        <td>
-            <div class="admin-name">
-                <span class="party-dot ${d.party}"></span>
-                <span>${d.name}</span>
-            </div>
-            <div style="font-size:12px;color:#6c757d;margin-left:18px">${d.years}</div>
-        </td>
-        <td class="num">${d.approved.toLocaleString()}</td>
-        <td class="num">${d.denied.toLocaleString()}</td>
-        <td class="num">${total.toLocaleString()}</td>
-        <td class="num">
-            <span class="rate-bar denial" style="width:${rateBarW}px"></span>
-            <span class="denial-rate">${d.denialRate}%</span>
-        </td>
-        <td class="num">
-            <div class="days-cell">
-                <span class="days-bar" style="width:${approvalBarW}px"></span>
-                <span>${d.medianApproval} days</span>
-            </div>
-        </td>
-        <td class="num">
-            <div class="days-cell">
-                <span class="days-bar" style="width:${denialBarW}px; background:#dc3545;"></span>
-                <span>${d.medianDenial} days</span>
-            </div>
-        </td>
-    `;
-    tbody.appendChild(tr);
-});
+function renderTable(data){
+    const maxMedianApproval = Math.max(...data.map(d => d.medianApproval));
+    const maxMedianDenial = Math.max(...data.map(d => d.medianDenial));
+    const maxDenialRate = Math.max(...data.map(d => d.denialRate));
+
+    const tbody = document.getElementById('tableBody');
+    tbody.innerHTML = '';
+    data.forEach(d => {
+        const total = d.approved + d.denied;
+        const approvalBarW = Math.round((d.medianApproval / maxMedianApproval) * 60);
+        const denialBarW = Math.round((d.medianDenial / maxMedianDenial) * 60);
+        const rateBarW = Math.round((d.denialRate / maxDenialRate) * 50);
+
+        const tr = document.createElement('tr');
+        if (d.highlight) tr.classList.add('highlight-row');
+        tr.innerHTML = `
+            <td>
+                <div class="admin-name">
+                    <span class="party-dot ${d.party}"></span>
+                    <span>${d.name}</span>
+                </div>
+                <div style="font-size:12px;color:#6c757d;margin-left:18px">${d.years}</div>
+            </td>
+            <td class="num">${d.approved.toLocaleString()}</td>
+            <td class="num">${d.denied.toLocaleString()}</td>
+            <td class="num">${total.toLocaleString()}</td>
+            <td class="num">
+                <span class="rate-bar denial" style="width:${rateBarW}px"></span>
+                <span class="denial-rate">${d.denialRate}%</span>
+            </td>
+            <td class="num">
+                <div class="days-cell">
+                    <span class="days-bar" style="width:${approvalBarW}px"></span>
+                    <span>${d.medianApproval} days</span>
+                </div>
+            </td>
+            <td class="num">
+                <div class="days-cell">
+                    <span class="days-bar" style="width:${denialBarW}px; background:#dc3545;"></span>
+                    <span>${d.medianDenial} days</span>
+                </div>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+(async function init(){
+    const status = document.getElementById('status');
+    try {
+        const raw = await getData();
+        const data = computeData(raw);
+        renderTable(data);
+        const today = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+        status.innerHTML = `<span class="live">● Live</span> — fetched from OpenFEMA on ${today}`;
+    } catch (e) {
+        console.error(e);
+        renderTable(FB_DATA);
+        status.innerHTML = `<span class="stale">● Offline</span> — couldn't reach OpenFEMA; showing last computed values.`;
+    }
+})();
 </script>
 </body>
 </html>

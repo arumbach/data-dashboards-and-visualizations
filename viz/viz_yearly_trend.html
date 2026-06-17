@@ -17,6 +17,9 @@
         .subtitle { font-size: 13px; color: #6c757d; margin-bottom: 24px; }
         .chart-wrap { position: relative; height: 420px; margin-bottom: 16px; }
         .footnote { font-size: 11px; color: #6c757d; line-height: 1.6; margin-top: 12px; }
+        .status{font-size:11px;color:#6c757d;margin-bottom:8px;min-height:14px}
+        .status .live{color:#28a745;font-weight:600}
+        .status .stale{color:#b45309;font-weight:600}
         .btn-download {
             display: inline-block; margin-top: 16px; padding: 8px 16px;
             background: #003366; color: white; border: none; border-radius: 4px;
@@ -35,6 +38,7 @@
     </div>
     <h1>Major Disaster Declarations by Year</h1>
     <p class="subtitle">Annual approved and denied Major Disaster declarations with administration transition markers (2001–2026)</p>
+    <div id="status" class="status"></div>
     <div class="chart-wrap"><canvas id="chart"></canvas></div>
     <div class="footnote">
         Each year shows total approved and denied declarations decided that calendar year.
@@ -46,9 +50,8 @@
 <script>
 Chart.defaults.font.family = "'Aptos', 'Segoe UI', Roboto, sans-serif";
 
-// Aggregate by year (combining both admins if a year is split)
-const yearData = {};
-const rawRows = [
+// Fallback hardcoded data (used if the OpenFEMA API can't be reached)
+const FB_rawRows = [
     {y:2001,app:41,den:11},
     {y:2002,app:49,den:9},
     {y:2003,app:56,den:14},
@@ -77,10 +80,6 @@ const rawRows = [
     {y:2026,app:12,den:7}
 ];
 
-const years = rawRows.map(r => r.y);
-const approved = rawRows.map(r => r.app);
-const denied = rawRows.map(r => r.den);
-
 // Administration transition lines (inauguration years)
 const transitions = [
     { x: '2005', label: 'Bush 2' },
@@ -91,109 +90,166 @@ const transitions = [
     { x: '2025', label: 'Trump 2' }
 ];
 
-// Background bands for administrations
-const adminBands = [
-    { x1: 2000.5, x2: 2004.5, color: 'rgba(185,28,28,0.06)', label: 'Bush 1' },
-    { x1: 2004.5, x2: 2008.5, color: 'rgba(248,113,113,0.06)', label: 'Bush 2' },
-    { x1: 2008.5, x2: 2012.5, color: 'rgba(29,78,216,0.06)', label: 'Obama 1' },
-    { x1: 2012.5, x2: 2016.5, color: 'rgba(59,130,246,0.06)', label: 'Obama 2' },
-    { x1: 2016.5, x2: 2020.5, color: 'rgba(220,38,38,0.06)', label: 'Trump 1' },
-    { x1: 2020.5, x2: 2024.5, color: 'rgba(37,99,235,0.06)', label: 'Biden' },
-    { x1: 2024.5, x2: 2026.5, color: 'rgba(239,68,68,0.06)', label: 'Trump 2' }
-];
+let chart;
 
-const annotations = {};
-adminBands.forEach((band, i) => {
-    annotations['band'+i] = {
-        type: 'box',
-        xMin: years.indexOf(Math.ceil(band.x1)),
-        xMax: years.indexOf(Math.floor(band.x2)),
-        backgroundColor: band.color,
-        borderWidth: 0
-    };
-});
-transitions.forEach((t, i) => {
-    const idx = years.indexOf(parseInt(t.x));
-    if (idx >= 0) {
-        annotations['line'+i] = {
-            type: 'line',
-            xMin: idx - 0.5,
-            xMax: idx - 0.5,
-            borderColor: '#999',
-            borderWidth: 1,
-            borderDash: [4, 4],
-            label: {
-                display: true,
-                content: t.label,
-                position: 'start',
-                backgroundColor: 'rgba(0,0,0,0.7)',
-                color: '#fff',
-                font: { size: 10 },
-                padding: 4
-            }
+const API='https://www.fema.gov/api/open/v1/';
+async function fetchAll(ep,filter,select){
+  let out=[],skip=0;
+  while(true){
+    const q=`$filter=${encodeURIComponent(filter)}&$select=${encodeURIComponent(select)}&$top=1000&$skip=${skip}&$format=json`;
+    const r=await fetch(API+ep+'?'+q); if(!r.ok) throw new Error(ep+' '+r.status);
+    const d=await r.json(); const k=Object.keys(d).find(x=>x!=='metadata'); const rows=d[k]||[];
+    out=out.concat(rows); if(rows.length<1000) break; skip+=1000;
+  }
+  return out;
+}
+const d10=d=>(d||'').slice(0,10);
+async function getData(){
+  const [approvedRaw,deniedRaw]=await Promise.all([
+    fetchAll('FemaWebDisasterDeclarations',"declarationType eq 'Major Disaster' and declarationDate ge '2001-01-01'",'disasterNumber,declarationDate,incidentType'),
+    fetchAll('DeclarationDenials',"declarationRequestType eq 'Major Disaster' and declarationRequestDate ge '2000-06-01'",'requestStatusDate,currentRequestStatus,requestedIncidentTypes')
+  ]);
+  const seen=new Set(); const approved=[];
+  for(const r of approvedRaw){ if(seen.has(r.disasterNumber))continue; seen.add(r.disasterNumber); if((r.incidentType||'')==='Biological')continue; approved.push(r); }
+  const denied=deniedRaw.filter(r=>r.currentRequestStatus==='Turndown' && !((r.requestedIncidentTypes||'').includes('Biological')));
+  return {approved,denied};
+}
+function buildRawRows(approved,denied){
+  const ya={}, yd={};
+  for(const r of approved){ const y=+d10(r.declarationDate).slice(0,4); if(y>=2001) ya[y]=(ya[y]||0)+1; }
+  for(const r of denied){ const y=+d10(r.requestStatusDate).slice(0,4); if(y>=2001) yd[y]=(yd[y]||0)+1; }
+  const maxY=Math.max(2001,...Object.keys(ya).map(Number),...Object.keys(yd).map(Number));
+  const rows=[];
+  for(let y=2001;y<=maxY;y++) rows.push({y, app: ya[y]||0, den: yd[y]||0});
+  return rows;
+}
+
+function buildChart(rawRows) {
+    const years = rawRows.map(r => r.y);
+    const approved = rawRows.map(r => r.app);
+    const denied = rawRows.map(r => r.den);
+
+    const maxYear = Math.max(...years);
+
+    // Background bands for administrations
+    const adminBands = [
+        { x1: 2000.5, x2: 2004.5, color: 'rgba(185,28,28,0.06)', label: 'Bush 1' },
+        { x1: 2004.5, x2: 2008.5, color: 'rgba(248,113,113,0.06)', label: 'Bush 2' },
+        { x1: 2008.5, x2: 2012.5, color: 'rgba(29,78,216,0.06)', label: 'Obama 1' },
+        { x1: 2012.5, x2: 2016.5, color: 'rgba(59,130,246,0.06)', label: 'Obama 2' },
+        { x1: 2016.5, x2: 2020.5, color: 'rgba(220,38,38,0.06)', label: 'Trump 1' },
+        { x1: 2020.5, x2: 2024.5, color: 'rgba(37,99,235,0.06)', label: 'Biden' },
+        { x1: 2024.5, x2: maxYear + 0.5, color: 'rgba(239,68,68,0.06)', label: 'Trump 2' }
+    ];
+
+    const annotations = {};
+    adminBands.forEach((band, i) => {
+        annotations['band'+i] = {
+            type: 'box',
+            xMin: years.indexOf(Math.ceil(band.x1)),
+            xMax: years.indexOf(Math.floor(band.x2)),
+            backgroundColor: band.color,
+            borderWidth: 0
         };
-    }
-});
+    });
+    transitions.forEach((t, i) => {
+        const idx = years.indexOf(parseInt(t.x));
+        if (idx >= 0) {
+            annotations['line'+i] = {
+                type: 'line',
+                xMin: idx - 0.5,
+                xMax: idx - 0.5,
+                borderColor: '#999',
+                borderWidth: 1,
+                borderDash: [4, 4],
+                label: {
+                    display: true,
+                    content: t.label,
+                    position: 'start',
+                    backgroundColor: 'rgba(0,0,0,0.7)',
+                    color: '#fff',
+                    font: { size: 10 },
+                    padding: 4
+                }
+            };
+        }
+    });
 
-const ctx = document.getElementById('chart').getContext('2d');
-const chart = new Chart(ctx, {
-    type: 'bar',
-    data: {
-        labels: years,
-        datasets: [
-            {
-                label: 'Approved',
-                data: approved,
-                backgroundColor: 'rgba(40, 167, 69, 0.8)',
-                borderColor: '#28a745',
-                borderWidth: 1,
-                borderRadius: 3
-            },
-            {
-                label: 'Denied',
-                data: denied,
-                backgroundColor: 'rgba(220, 53, 69, 0.8)',
-                borderColor: '#dc3545',
-                borderWidth: 1,
-                borderRadius: 3
-            }
-        ]
-    },
-    options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-            legend: {
-                position: 'top',
-                labels: { font: { size: 12 }, usePointStyle: true, pointStyle: 'rectRounded', padding: 20 }
-            },
-            annotation: { annotations: annotations },
-            tooltip: {
-                callbacks: {
-                    afterBody: function(items) {
-                        const i = items[0].dataIndex;
-                        const total = approved[i] + denied[i];
-                        const rate = ((approved[i] / total) * 100).toFixed(1);
-                        return `Total: ${total} | Approval rate: ${rate}%`;
+    const ctx = document.getElementById('chart').getContext('2d');
+    chart = new Chart(ctx, {
+        type: 'bar',
+        data: {
+            labels: years,
+            datasets: [
+                {
+                    label: 'Approved',
+                    data: approved,
+                    backgroundColor: 'rgba(40, 167, 69, 0.8)',
+                    borderColor: '#28a745',
+                    borderWidth: 1,
+                    borderRadius: 3
+                },
+                {
+                    label: 'Denied',
+                    data: denied,
+                    backgroundColor: 'rgba(220, 53, 69, 0.8)',
+                    borderColor: '#dc3545',
+                    borderWidth: 1,
+                    borderRadius: 3
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: {
+                    position: 'top',
+                    labels: { font: { size: 12 }, usePointStyle: true, pointStyle: 'rectRounded', padding: 20 }
+                },
+                annotation: { annotations: annotations },
+                tooltip: {
+                    callbacks: {
+                        afterBody: function(items) {
+                            const i = items[0].dataIndex;
+                            const total = approved[i] + denied[i];
+                            const rate = ((approved[i] / total) * 100).toFixed(1);
+                            return `Total: ${total} | Approval rate: ${rate}%`;
+                        }
                     }
                 }
-            }
-        },
-        scales: {
-            x: {
-                stacked: true,
-                grid: { display: false },
-                ticks: { font: { size: 11 } }
             },
-            y: {
-                stacked: true,
-                beginAtZero: true,
-                title: { display: true, text: 'Number of Declarations', font: { size: 13, weight: '600' } },
-                grid: { color: '#f0f0f0' }
+            scales: {
+                x: {
+                    stacked: true,
+                    grid: { display: false },
+                    ticks: { font: { size: 11 } }
+                },
+                y: {
+                    stacked: true,
+                    beginAtZero: true,
+                    title: { display: true, text: 'Number of Declarations', font: { size: 13, weight: '600' } },
+                    grid: { color: '#f0f0f0' }
+                }
             }
         }
-    }
-});
+    });
+}
+
+async function load(){
+  const statusEl = document.getElementById('status');
+  try{
+    const {approved,denied}=await getData();
+    buildChart(buildRawRows(approved,denied));
+    const today = new Date().toLocaleDateString('en-US',{year:'numeric',month:'long',day:'numeric'});
+    statusEl.innerHTML = `<span class="live">● Live</span> — fetched from OpenFEMA on ${today}`;
+  }catch(e){
+    console.error(e);
+    buildChart(FB_rawRows);
+    statusEl.innerHTML = `<span class="stale">● Offline</span> — couldn't reach OpenFEMA; showing last computed values.`;
+  }
+}
+load();
 
 function downloadPNG() {
     const link = document.createElement('a');
